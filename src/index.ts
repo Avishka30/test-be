@@ -24,38 +24,63 @@ app.use(
 
 app.use(express.json());
 
-// --- DATABASE CONNECTION LOGIC (CRITICAL FOR VERCEL) ---
+// --- ROBUST DATABASE CONNECTION (VERCEL FIX) ---
 const MONGO_URI = process.env.MONGO_URI;
 
-const connectDB = async () => {
-  // If already connected, reuse connection to prevent multiple connections
-  if (mongoose.connection.readyState >= 1) {
-    return;
-  }
-  
-  if (!MONGO_URI) {
-    console.error("❌ Error: MONGO_URI is not defined.");
-    return;
+if (!MONGO_URI) {
+  throw new Error("❌ MONGO_URI is not defined in .env file");
+}
+
+// Initialize global cache to survive hot reloads/serverless restarts
+let cached = (global as any).mongoose;
+
+if (!cached) {
+  cached = (global as any).mongoose = { conn: null, promise: null };
+}
+
+async function connectDB() {
+  // 1. If a connection already exists, return it immediately
+  if (cached.conn) {
+    return cached.conn;
   }
 
-  try {
-    await mongoose.connect(MONGO_URI, {
-      serverSelectionTimeoutMS: 5000, 
-      socketTimeoutMS: 45000, 
+  // 2. If no connection exists, create a new one
+  if (!cached.promise) {
+    const opts = {
+      bufferCommands: false, // Disable buffering (Critical for Serverless!)
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+    };
+
+    console.log("🔄 Initializing new database connection...");
+    
+    cached.promise = mongoose.connect(MONGO_URI!, opts).then((mongoose) => {
+      console.log('✅ New Database Connection Established');
+      return mongoose;
     });
-    console.log('✅ Database connected successfully!');
-  } catch (err) {
-    console.error('❌ Database connection error:', err);
   }
-};
 
-// Connect immediately when the serverless function starts
-connectDB();
+  // 3. Await the connection promise
+  try {
+    cached.conn = await cached.promise;
+  } catch (e) {
+    cached.promise = null;
+    console.error("❌ DB Connection Error:", e);
+    throw e;
+  }
+
+  return cached.conn;
+}
 
 // Middleware: Ensure DB is connected before handling ANY request
 app.use(async (req, res, next) => {
-  await connectDB();
-  next();
+  try {
+    await connectDB();
+    next();
+  } catch (error) {
+    console.error("❌ Fatal DB Error in Middleware:", error);
+    res.status(500).json({ message: "Database connection failed" });
+  }
 });
 
 // --- ROUTES ---
@@ -73,7 +98,6 @@ app.use('/api/ai', aiRoutes);
 app.use('/api/admin', adminRoutes); 
 
 // Start Server (Only locally)
-// Vercel handles the server start automatically in production
 const PORT = process.env.PORT || 3000;
 if (process.env.NODE_ENV !== 'production') {
     app.listen(PORT, () => {
